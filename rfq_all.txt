@@ -1,0 +1,24 @@
+Please provide an itemized commercial quote for this initial test batch:
+
+## Technical Specifications & Volumes
+* SKU 01: Gen 5 OCuLink Cable (SFF-8611 to SFF-8611)
+* Volume: 50 Units (Split 50% at 0.5m / 50% at 1.0m).
+* Specs: Dual locking male SFF-8611, 4-lane PCIe Gen 4/5, 85-ohm differential impedance matching, high-density EMI shielding.
+
+* SKU 02: SlimSAS (SFF-8654 8i) to 2x U.2 (SFF-8639) PCIe NVMe Cable
+* Volume: 50 Units (0.75m or 1.0m length).
+* Specs: SFF-8654 (8i) to 2x SFF-8639 (U.2) dual-channel, Gen 4/5 ready, integrated dual SATA power leads.
+
+* SKU 03: 12VHPWR / 12V-2x6 Power Cable * Volume: 10 Units.
+* Specs: Dual 8-Pin EPS to 16-Pin Gen 5 PCIe, 600W continuous compute threshold.
+* Wire Gauge: Strictly 16AWG pure copper core for power lanes. No 18AWG or CCA accepted.
+
+## Sourcing & Compliance Requirements
+
+Please explicitly confirm these 4 criteria to pass our university vendor gates:
+1. Signal Testing: Do you provide automated VNA or TDR test reports for Gen 5 batches?
+2. Compliance: Are all components strictly RoHS certified?
+3. Shipping: Quote DAP or DDP via Express Air Freight to Concord, Massachusetts (01742, USA).
+4. Samples: Confirm the lead time and cost for a 1-unit paid sample of each SKU.
+
+Please reply with your itemized pricing grid, production lead times, and accepted Trade Assurance payment methods.

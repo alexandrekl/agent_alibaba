@@ -1,0 +1,5 @@
+requests
+langgraph
+python-dotenv
+pytest
+apify-client
