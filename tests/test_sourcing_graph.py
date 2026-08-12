@@ -7,7 +7,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from sourcing_agent.apify_client import call_alibaba_proxy_api
 from sourcing_agent.run import format_supplier_summary
-from sourcing_agent.workflow import supplier_vet_node
+from sourcing_agent.workflow import (
+    refine_search_terms_node,
+    review_shortlist_node,
+    supplier_vet_node,
+)
 
 
 class SourcingGraphTests(unittest.TestCase):
@@ -38,6 +42,51 @@ class SourcingGraphTests(unittest.TestCase):
 
         self.assertEqual(result["shortlist"][0]["companyName"], "Trade Assurance Supplier")
         self.assertTrue(result["shortlist"][0]["trade_assurance"])
+
+    def test_review_shortlist_tracks_rejected_listings(self):
+        state = {
+            "shortlist": [
+                {"companyName": "Good Supplier", "title": "RoHS USB cable"},
+                {"companyName": "Pricey Supplier", "title": "USB cable"},
+                {"companyName": "MOQ Problem", "title": "USB cable"},
+            ],
+            "user_feedback": [
+                {"index": 1, "keep": True, "reason": "good match"},
+                {"index": 2, "keep": False, "reason": "too expensive"},
+                {"index": 3, "keep": False, "reason": "MOQ above target"},
+            ],
+            "logs": [],
+        }
+
+        result = review_shortlist_node(state)
+
+        self.assertEqual(len(result["rejected_listings"]), 2)
+        self.assertEqual(result["rejected_listings"][0]["companyName"], "Pricey Supplier")
+
+    def test_refine_search_terms_uses_user_feedback(self):
+        state = {
+            "raw_query": "USB-C cable under $20",
+            "search_payload": {
+                "keyword": "usb c cable",
+                "max_price_usd": 20.0,
+                "max_moq": 500,
+            },
+            "user_feedback": [
+                {"index": 1, "keep": False, "reason": "not RoHS compliant"},
+                {"index": 2, "keep": False, "reason": "MOQ too high"},
+            ],
+            "rejected_listings": [
+                {"companyName": "Bad Supplier", "title": "USB-C cable", "price": "20.50"},
+            ],
+            "review_round": 0,
+            "logs": [],
+        }
+
+        result = refine_search_terms_node(state)
+
+        self.assertIn("rohs", result["search_payload"]["keyword"].lower())
+        self.assertIn("usb", result["search_payload"]["keyword"].lower())
+        self.assertLess(result["search_payload"]["max_moq"], 500)
 
     def test_currency_display_uses_source_text_when_available(self):
         supplier = {"companyName": "Example", "price": "$2.98-3.97 TL", "currency": "TL"}

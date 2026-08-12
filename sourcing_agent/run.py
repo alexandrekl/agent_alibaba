@@ -1,14 +1,55 @@
 import argparse
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from .workflow import create_app
 
 
+def collect_user_feedback(shortlist: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Ask the user to keep or reject each shortlist listing."""
+    feedback: List[Dict[str, Any]] = []
+    for idx, supplier in enumerate(shortlist[:5], start=1):
+        company = supplier.get("companyName") or supplier.get("supplier") or "Unknown supplier"
+        title = supplier.get("title") or supplier.get("productName") or supplier.get("name") or "Untitled listing"
+        choice = input(f"Keep {idx}. {company} - {title}? [Y/n]: ").strip().lower()
+        keep = choice not in {"n", "no"}
+        reason = ""
+        if not keep:
+            reason = input(f"Reason for rejecting {idx}. {company}? ").strip() or "not suitable"
+        feedback.append({
+            "index": idx,
+            "keep": keep,
+            "reason": reason,
+        })
+    return feedback
+
+
 def run_sourcing_agent(raw_query: str) -> Dict[str, Any]:
-    """Run the full sourcing workflow for a single user request."""
+    """Run the full sourcing workflow for a single user request with an interactive shortlist review loop."""
     app = create_app()
-    return app.invoke({"raw_query": raw_query, "logs": []})
+    current_state: Dict[str, Any] = {"raw_query": raw_query, "logs": []}
+
+    for _ in range(3):
+        result = app.invoke(current_state)
+        shortlist = result.get("accepted_shortlist") or result.get("shortlist") or []
+        if not shortlist:
+            return result
+
+        user_feedback = collect_user_feedback(shortlist)
+        if not user_feedback:
+            return result
+
+        if all(item.get("keep", True) for item in user_feedback):
+            return result
+
+        current_state = {
+            **result,
+            "user_feedback": user_feedback,
+            "rejected_listings": result.get("rejected_listings", []),
+            "logs": result.get("logs", []),
+        }
+
+    return app.invoke(current_state)
 
 
 def format_supplier_summary(supplier: Dict[str, Any], idx: int) -> str:
@@ -58,9 +99,22 @@ def main(argv: list[str] | None = None) -> None:
 
     final_output = run_sourcing_agent(initial_query)
 
+    accepted = final_output.get("accepted_shortlist") or final_output.get("shortlist") or []
     print("\n--- FINAL SHORTLISTED SUPPLIERS ---")
-    for idx, supplier in enumerate(final_output.get("shortlist", []), 1):
-        print(format_supplier_summary(supplier, idx))
+    if not accepted:
+        print("No shortlisted suppliers were accepted.")
+    else:
+        for idx, supplier in enumerate(accepted, 1):
+            print(format_supplier_summary(supplier, idx))
+
+    if final_output.get("refinement_notes"):
+        print("\n--- REFINEMENT NOTES ---")
+        print(final_output["refinement_notes"])
+
+    if final_output.get("logs"):
+        print("\n--- WORKFLOW LOG ---")
+        for line in final_output["logs"]:
+            print(f"- {line}")
 
 
 if __name__ == "__main__":

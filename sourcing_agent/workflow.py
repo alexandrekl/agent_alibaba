@@ -1,9 +1,10 @@
 import re
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from langgraph.graph import END, StateGraph
 
 from .apify_client import call_alibaba_proxy_api
+from .llm_client import refine_search_with_provider
 from .models import SourcingState
 from .requirements_parser import parse_requirements
 
@@ -14,7 +15,13 @@ def requirement_analyzer_node(state: SourcingState) -> Dict[str, Any]:
     payload = parse_requirements(query)
     return {
         "search_payload": payload,
-        "logs": state.get("logs", []) + [f"Parsed request into keyword='{payload['keyword']}' with max MOQ {payload['max_moq']}."],
+        "shortlist": [],
+        "user_feedback": state.get("user_feedback", []),
+        "rejected_listings": [],
+        "accepted_shortlist": [],
+        "review_round": 0,
+        "refinement_notes": "",
+        "logs": state.get("logs", []) + [f"Parsed request into keyword='{payload['keyword']}' with max MOQ {payload['max_moq']}."]
     }
 
 
@@ -78,11 +85,105 @@ def supplier_vet_node(state: SourcingState) -> Dict[str, Any]:
     ))
 
     filtered_shortlist = [entry[5] for entry in ranked_candidates]
-
     return {
         "shortlist": filtered_shortlist,
+        "accepted_shortlist": filtered_shortlist[:5],
         "logs": state["logs"] + ["Completed relevance-first ranking, with trade-assurance and verification as secondary signals."],
     }
+
+
+def review_shortlist_node(state: SourcingState) -> Dict[str, Any]:
+    print("--- [Node D] Reviewing top listings with the user ---")
+    shortlist = state.get("shortlist", [])
+    user_feedback = state.get("user_feedback", [])
+
+    rejected: List[Dict[str, Any]] = []
+    accepted: List[Dict[str, Any]] = []
+
+    for feedback in user_feedback:
+        raw_index = int(feedback.get("index", 0))
+        supplier_index = raw_index - 1 if raw_index > 0 else 0
+        keep = bool(feedback.get("keep", True))
+        if 0 <= supplier_index < len(shortlist):
+            supplier = dict(shortlist[supplier_index])
+            supplier["review_reason"] = feedback.get("reason", "")
+            if keep:
+                accepted.append(supplier)
+            else:
+                rejected.append(supplier)
+
+    if not user_feedback:
+        accepted = shortlist[:5]
+
+    return {
+        "accepted_shortlist": accepted or shortlist[:5],
+        "rejected_listings": rejected,
+        "logs": state.get("logs", []) + [f"Reviewed {len(shortlist[:5])} listing candidates with user feedback."],
+    }
+
+
+def refine_search_terms_node(state: SourcingState) -> Dict[str, Any]:
+    print("--- [Node E] Refining search terms from user feedback ---")
+    search_payload = dict(state.get("search_payload", {}))
+    raw_query = state.get("raw_query", "")
+    user_feedback = state.get("user_feedback", [])
+    rejected = state.get("rejected_listings", [])
+    review_round = int(state.get("review_round", 0))
+
+    provider_result = refine_search_with_provider(
+        raw_query=raw_query,
+        search_payload=search_payload,
+        user_feedback=user_feedback,
+        rejected_listings=rejected,
+    )
+
+    updated_payload = dict(search_payload)
+    updated_payload["keyword"] = provider_result["keyword"]
+    updated_payload["max_moq"] = provider_result["max_moq"]
+    updated_payload["max_price_usd"] = provider_result["max_price_usd"]
+
+    combined_feedback = " ".join(
+        [
+            str(item.get("reason", "")).strip()
+            for item in user_feedback
+            if str(item.get("reason", "")).strip()
+        ]
+        + [
+            str(item.get("review_reason", "")).strip()
+            for item in rejected
+            if str(item.get("review_reason", "")).strip()
+        ]
+    ).lower()
+
+    if "rohs" in combined_feedback or "compliance" in combined_feedback:
+        updated_payload["keyword"] = f"rohs {updated_payload['keyword']}".strip()
+
+    if "too expensive" in combined_feedback or "price" in combined_feedback or "budget" in combined_feedback:
+        current_limit = float(updated_payload.get("max_price_usd") or 0.0)
+        if current_limit > 0:
+            updated_payload["max_price_usd"] = round(max(1.0, current_limit * 0.85), 2)
+        elif search_payload.get("max_price_usd") is not None:
+            updated_payload["max_price_usd"] = round(max(1.0, float(search_payload.get("max_price_usd")) * 0.85), 2)
+
+    if "moq" in combined_feedback or "minimum order" in combined_feedback or "order quantity" in combined_feedback:
+        current_limit = int(updated_payload.get("max_moq") or search_payload.get("max_moq") or 1000)
+        updated_payload["max_moq"] = max(1, current_limit // 2)
+
+    new_round = review_round + 1
+    return {
+        "search_payload": updated_payload,
+        "review_round": new_round,
+        "refinement_notes": provider_result["notes"],
+        "logs": state.get("logs", []) + [f"Refined search terms via model adapter and moved to review round {new_round}."],
+    }
+
+
+def should_refine_search(state: SourcingState) -> str:
+    rejected = state.get("rejected_listings", [])
+    review_round = int(state.get("review_round", 0))
+    if rejected and review_round < 3:
+        return "refine_search_terms"
+    return END
 
 
 def _score_title_relevance(title: str, keyword: str) -> int:
@@ -141,10 +242,21 @@ def build_workflow() -> StateGraph:
     workflow.add_node("analyze_requirements", requirement_analyzer_node)
     workflow.add_node("fetch_alibaba_data", api_sourcing_node)
     workflow.add_node("vet_and_rank_suppliers", supplier_vet_node)
+    workflow.add_node("review_shortlist", review_shortlist_node)
+    workflow.add_node("refine_search_terms", refine_search_terms_node)
     workflow.set_entry_point("analyze_requirements")
     workflow.add_edge("analyze_requirements", "fetch_alibaba_data")
     workflow.add_edge("fetch_alibaba_data", "vet_and_rank_suppliers")
-    workflow.add_edge("vet_and_rank_suppliers", END)
+    workflow.add_edge("vet_and_rank_suppliers", "review_shortlist")
+    workflow.add_conditional_edges(
+        "review_shortlist",
+        should_refine_search,
+        {
+            "refine_search_terms": "refine_search_terms",
+            END: END,
+        },
+    )
+    workflow.add_edge("refine_search_terms", "fetch_alibaba_data")
     return workflow
 
 
