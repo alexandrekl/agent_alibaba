@@ -56,6 +56,34 @@ def call_decisions(sku_num: str) -> Dict[str, List[Dict[str, str]]]:
     return response.json()
 
 
+def call_admin_create(listing: Dict[str, str]) -> Dict[str, Any]:
+    response = requests.post(
+        f"{API_BASE_URL}/api/v1/admin/listings", json=listing, timeout=120
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def call_admin_update(listing_id: int, status: str, notes: str) -> Dict[str, Any]:
+    response = requests.patch(
+        f"{API_BASE_URL}/api/v1/admin/listings/{listing_id}",
+        json={"status": status, "notes": notes},
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def call_admin_delete(listing_id: int, sku_num: str) -> Dict[str, Any]:
+    response = requests.delete(
+        f"{API_BASE_URL}/api/v1/admin/listings/{listing_id}",
+        params={"sku_num": sku_num},
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 def listing_title(item: Dict[str, Any]) -> str:
     return str(item.get("title") or item.get("productName") or item.get("name") or "Untitled listing")
 
@@ -125,6 +153,81 @@ rfq_text = st.text_area(
     height=160,
     placeholder="Enter product type, connector, compliance, target price, MOQ, etc.",
 )
+
+if sku_num.strip():
+    with st.expander("Admin panel"):
+        st.caption("Manage the persisted listings for this SKU.")
+        with st.form("add_manual_listing", clear_on_submit=True):
+            st.markdown("#### Add listing manually")
+            manual_title = st.text_input("Listing title")
+            manual_supplier = st.text_input("Supplier")
+            manual_url = st.text_input("Listing URL")
+            manual_status = st.selectbox("Status", ("Approved", "Rejected"))
+            manual_notes = st.text_area("Notes", height=80)
+            add_listing = st.form_submit_button("Add listing")
+
+            if add_listing:
+                try:
+                    call_admin_create(
+                        {
+                            "sku_num": sku_num.strip(),
+                            "listing_title": manual_title,
+                            "supplier": manual_supplier,
+                            "listing_url": manual_url,
+                            "status": manual_status,
+                            "notes": manual_notes,
+                        }
+                    )
+                    st.success("Listing added.")
+                    st.rerun()
+                except Exception as exc:  # pragma: no cover - UI only
+                    st.error(f"Could not add listing: {exc}")
+
+        try:
+            admin_decisions = call_decisions(sku_num.strip())
+            admin_rows = [
+                ("Approved", row) for row in admin_decisions.get("accepted", [])
+            ] + [
+                ("Rejected", row) for row in admin_decisions.get("rejected", [])
+            ]
+            if admin_rows:
+                st.markdown("#### Edit persisted listings")
+                for current_status, row in admin_rows:
+                    listing_id = row["id"]
+                    title = row.get("listing_title") or "Untitled listing"
+                    supplier = row.get("supplier") or "Unknown supplier"
+                    with st.form(f"edit_listing_{listing_id}"):
+                        st.markdown(f"**{supplier} | {title}**")
+                        updated_status = st.selectbox(
+                            "Status",
+                            ("Approved", "Rejected"),
+                            index=0 if current_status == "Approved" else 1,
+                            key=f"status_{listing_id}",
+                        )
+                        updated_notes = st.text_area(
+                            "Notes",
+                            value=row.get("reason") or "",
+                            height=80,
+                            key=f"notes_{listing_id}",
+                        )
+                        save_listing = st.form_submit_button("Save changes")
+                        delete_listing = st.form_submit_button("Delete listing")
+
+                        try:
+                            if save_listing:
+                                call_admin_update(listing_id, updated_status, updated_notes)
+                                st.success("Listing updated.")
+                                st.rerun()
+                            if delete_listing:
+                                call_admin_delete(listing_id, sku_num.strip())
+                                st.success("Listing deleted.")
+                                st.rerun()
+                        except Exception as exc:  # pragma: no cover - UI only
+                            st.error(f"Could not update listing: {exc}")
+            else:
+                st.info("No persisted listings for this SKU yet.")
+        except Exception as exc:  # pragma: no cover - UI only
+            st.error(f"Could not load listings: {exc}")
 
 if st.button("Fetch shortlist") and sku_num.strip() and rfq_text.strip():
     try:
