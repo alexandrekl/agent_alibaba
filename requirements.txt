@@ -3,3 +3,6 @@ langgraph
 python-dotenv
 pytest
 apify-client
+fastapi
+uvicorn
+streamlit

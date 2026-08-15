@@ -4,31 +4,29 @@ from typing import Any, Dict
 
 def parse_requirements(query: str) -> Dict[str, Any]:
     """Turn a plain-English request into structured sourcing parameters."""
-    cleaned_query = query.strip()
+    cleaned_query = (query or "").strip()
+    if not cleaned_query:
+        return {"keyword": "products", "max_price_usd": None, "max_moq": 1000}
 
-    keyword_candidates = []
-    for line in cleaned_query.splitlines():
-        line = line.strip()
-        if not line:
+    normalized = cleaned_query.replace("\n", " ")
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = re.sub(r"(?i)\b(?:sku|volume|specs|requirements|rfq|request)\b[:\-]*", " ", normalized)
+    normalized = re.sub(r"(?i)\b(?:rohs|compliant|compliance|certified|silver|gold|white|black)\b", " ", normalized)
+    normalized = re.sub(r"[^a-zA-Z0-9\-\s]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    tokens = []
+    for token in normalized.split():
+        clean = token.strip("-_.")
+        if len(clean) <= 1:
             continue
-        line = re.sub(r"^\*\s*", "", line)
-        line = re.sub(r"^SKU\s*\d+:\s*", "", line, flags=re.IGNORECASE)
-        line = re.sub(r"^Volume:\s*", "", line, flags=re.IGNORECASE)
-        line = re.sub(r"^Specs:\s*", "", line, flags=re.IGNORECASE)
-        line = line.strip()
-        if line:
-            keyword_candidates.append(line)
+        if clean.lower() in {"under", "below", "up", "to", "at", "most", "for", "with", "and", "or", "of", "the", "a", "an", "please", "need"}:
+            continue
+        tokens.append(clean)
 
-    keyword = " ".join(keyword_candidates).strip()
+    keyword = " ".join(tokens[:12]).strip()
     if not keyword:
-        keyword = cleaned_query.strip() or "products"
-
-    keyword = re.sub(r"\s+", " ", keyword).strip()
-    keyword = re.sub(r"\b(?:volume|units|length|specs|sku)\b", "", keyword, flags=re.IGNORECASE)
-    keyword = re.sub(r"\s+", " ", keyword).strip()
-
-    if not keyword:
-        keyword = cleaned_query.strip() or "products"
+        keyword = "products"
 
     max_price_match = re.search(r"(?:under|below|up to|at most|<=)\s*\$?\s*(\d+(?:\.\d+)?)", query, re.IGNORECASE)
     max_price = float(max_price_match.group(1)) if max_price_match else None

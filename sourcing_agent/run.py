@@ -43,11 +43,16 @@ def run_sourcing_agent(raw_query: str) -> Dict[str, Any]:
             return result
 
         current_state = {
-            **result,
-            "user_feedback": user_feedback,
-            "rejected_listings": result.get("rejected_listings", []),
+            "raw_query": raw_query,
+            "search_payload": result.get("search_payload", {}),
+            "review_round": result.get("review_round", 0),
+            "user_feedback": [],
+            "rejected_listings": [],
             "logs": result.get("logs", []),
         }
+
+        if result.get("search_payload"):
+            current_state["search_payload"] = result["search_payload"]
 
     return app.invoke(current_state)
 

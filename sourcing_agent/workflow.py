@@ -3,25 +3,39 @@ from typing import Any, Dict, List
 
 from langgraph.graph import END, StateGraph
 
-from .apify_client import call_alibaba_proxy_api
+from .apify_client import call_alibaba_proxy_api, _parse_moq, _parse_price
 from .llm_client import refine_search_with_provider
 from .models import SourcingState
 from .requirements_parser import parse_requirements
+from urllib.parse import urlsplit, urlunsplit
 
 
 def requirement_analyzer_node(state: SourcingState) -> Dict[str, Any]:
     print("--- [Node A] Analyzing sourcing requirements ---")
     query = state.get("raw_query", "")
-    payload = parse_requirements(query)
+    payload = state.get("search_payload") or parse_requirements(query)
+    preserved_logs = state.get("logs", [])
+
+    if state.get("search_payload"):
+        payload = dict(state["search_payload"])
+        preserved_logs = preserved_logs + [
+            f"Reused existing search payload with keyword='{payload.get('keyword')}' and max MOQ {payload.get('max_moq')}."]
+    else:
+        payload = parse_requirements(query)
+        preserved_logs = preserved_logs + [
+            f"Parsed request into keyword='{payload['keyword']}' with max MOQ {payload['max_moq']}."
+        ]
+
     return {
         "search_payload": payload,
         "shortlist": [],
-        "user_feedback": state.get("user_feedback", []),
-        "rejected_listings": [],
+        "user_feedback": [],
+        "accepted_listings": state.get("accepted_listings", []),
+        "rejected_listings": state.get("rejected_listings", []),
         "accepted_shortlist": [],
-        "review_round": 0,
-        "refinement_notes": "",
-        "logs": state.get("logs", []) + [f"Parsed request into keyword='{payload['keyword']}' with max MOQ {payload['max_moq']}."]
+        "review_round": int(state.get("review_round", 0)) if state.get("search_payload") else 0,
+        "refinement_notes": state.get("refinement_notes", ""),
+        "logs": preserved_logs,
     }
 
 
@@ -33,9 +47,25 @@ def api_sourcing_node(state: SourcingState) -> Dict[str, Any]:
         max_price=payload.get("max_price_usd"),
         max_moq=payload.get("max_moq"),
     )
+
+    # accepted_listings/rejected_listings may mix DB-shaped dicts (listing_title/supplier, from the
+    # first call) with raw-shaped dicts (title/companyName, appended by review_shortlist_node below).
+    accepted_history = state.get("accepted_listings", [])
+    rejected_history = state.get("rejected_listings", [])
+    seen_identities = {
+        _listing_identity(item)
+        for item in accepted_history + rejected_history
+        if isinstance(item, dict)
+    }
+    filtered_results = []
+    for item in results:
+        if _listing_identity(item) in seen_identities:
+            continue
+        filtered_results.append(item)
+
     return {
-        "raw_results": results,
-        "logs": state["logs"] + [f"Fetched {len(results)} raw listing hits from the data layer."],
+        "raw_results": filtered_results,
+        "logs": state["logs"] + [f"Fetched {len(filtered_results)} raw listing hits from the data layer after screening prior SKU decisions."],
     }
 
 
@@ -52,7 +82,7 @@ def supplier_vet_node(state: SourcingState) -> Dict[str, Any]:
         verified = bool(item.get("verified", True))
         moq_value = item.get("moq") or item.get("moqV2") or item.get("minimum_order_quantity")
         moq = _parse_moq(moq_value) if moq_value not in (None, "") else None
-        price = _parse_price(item.get("price_usd") or item.get("price") or item.get("priceUsd"))
+        price = _parse_price(item.get("price_usd") or item.get("price") or item.get("priceUsD"))
         trade_assurance = _parse_trade_assurance(item)
 
         if max_price is not None and price > max_price:
@@ -115,14 +145,19 @@ def review_shortlist_node(state: SourcingState) -> Dict[str, Any]:
     if not user_feedback:
         accepted = shortlist[:5]
 
+    # accepted/rejected are raw-shaped (title/companyName); see api_sourcing_node's note on mixed shapes.
     return {
+        "accepted_listings": state.get("accepted_listings", []) + accepted,
+        "rejected_listings": state.get("rejected_listings", []) + rejected,
         "accepted_shortlist": accepted or shortlist[:5],
-        "rejected_listings": rejected,
         "logs": state.get("logs", []) + [f"Reviewed {len(shortlist[:5])} listing candidates with user feedback."],
     }
 
 
 def refine_search_terms_node(state: SourcingState) -> Dict[str, Any]:
+    # Agentic refinement step: convert user feedback and rejected listing reasons into a
+    # better search payload. This is the part of the workflow that acts like a reasoning layer
+    # rather than a pure deterministic filter.
     print("--- [Node E] Refining search terms from user feedback ---")
     search_payload = dict(state.get("search_payload", {}))
     raw_query = state.get("raw_query", "")
@@ -138,9 +173,10 @@ def refine_search_terms_node(state: SourcingState) -> Dict[str, Any]:
     )
 
     updated_payload = dict(search_payload)
-    updated_payload["keyword"] = provider_result["keyword"]
-    updated_payload["max_moq"] = provider_result["max_moq"]
-    updated_payload["max_price_usd"] = provider_result["max_price_usd"]
+    keyword = str(provider_result.get("keyword") or search_payload.get("keyword") or raw_query or "products").strip()
+    updated_payload["keyword"] = _normalize_search_keyword(keyword, raw_query)
+    updated_payload["max_moq"] = provider_result.get("max_moq") if provider_result.get("max_moq") is not None else search_payload.get("max_moq")
+    updated_payload["max_price_usd"] = provider_result.get("max_price_usd") if provider_result.get("max_price_usd") is not None else search_payload.get("max_price_usd")
 
     combined_feedback = " ".join(
         [
@@ -156,7 +192,7 @@ def refine_search_terms_node(state: SourcingState) -> Dict[str, Any]:
     ).lower()
 
     if "rohs" in combined_feedback or "compliance" in combined_feedback:
-        updated_payload["keyword"] = f"rohs {updated_payload['keyword']}".strip()
+        updated_payload["keyword"] = _append_keyword_modifier(updated_payload["keyword"], "rohs")
 
     if "too expensive" in combined_feedback or "price" in combined_feedback or "budget" in combined_feedback:
         current_limit = float(updated_payload.get("max_price_usd") or 0.0)
@@ -179,11 +215,60 @@ def refine_search_terms_node(state: SourcingState) -> Dict[str, Any]:
 
 
 def should_refine_search(state: SourcingState) -> str:
+    # This guard decides whether the agentic search-refinement loop should iterate again.
+    # If the user rejects previous candidates and the review round has not exceeded the cap,
+    # the graph re-runs the agent to rephrase the query and tighten the search.
     rejected = state.get("rejected_listings", [])
     review_round = int(state.get("review_round", 0))
     if rejected and review_round < 3:
         return "refine_search_terms"
     return END
+
+
+def _normalize_search_keyword(keyword: str, raw_query: str) -> str:
+    text = keyword or raw_query or "products"
+    cleaned = re.sub(r"[^a-z0-9\s\-_.]+", " ", text.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"\b(?:volume|units|length|specs|sku|product|products)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return "products"
+    return cleaned
+
+
+def _normalize_listing_url(url: str) -> str:
+    url = str(url).strip()
+    if not url:
+        return ""
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", "")).lower()
+
+
+def _listing_identity(item: Dict[str, Any]) -> str:
+    listing_url = (
+        item.get("listing_url")
+        or item.get("url")
+        or item.get("productUrl")
+        or item.get("product_url")
+        or item.get("detailUrl")
+        or item.get("sourceUrl")
+        or item.get("link")
+        or ""
+    )
+    if listing_url:
+        return _normalize_listing_url(listing_url)
+    company = str(item.get("companyName") or item.get("supplier") or "").strip().lower()
+    title = str(item.get("title") or item.get("listing_title") or item.get("productName") or item.get("name") or "").strip().lower()
+    return f"{company}|{title}"
+
+
+def _append_keyword_modifier(keyword: str, modifier: str) -> str:
+    tokens = [part for part in re.split(r"\s+", keyword.strip()) if part]
+    modifier_tokens = [part for part in re.split(r"\s+", modifier.strip()) if part]
+    for part in modifier_tokens:
+        if part.lower() not in {token.lower() for token in tokens}:
+            tokens.append(part)
+    return " ".join(tokens)
 
 
 def _score_title_relevance(title: str, keyword: str) -> int:
@@ -225,16 +310,6 @@ def _parse_trade_assurance(item: Dict[str, Any]) -> bool:
             if normalized in {"false", "no", "n", "0", "none", "not available"}:
                 return False
     return False
-
-
-def _parse_moq(value: Any) -> int:
-    from .apify_client import _parse_moq as parse_moq
-    return parse_moq(value)
-
-
-def _parse_price(value: Any) -> float:
-    from .apify_client import _parse_price as parse_price
-    return parse_price(value)
 
 
 def build_workflow() -> StateGraph:

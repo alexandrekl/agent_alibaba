@@ -112,6 +112,9 @@ def refine_search_with_provider(
     rejected_listings: Iterable[Dict[str, Any]],
     provider: LLMProvider | None = None,
 ) -> Dict[str, Any]:
+    # This is the actual LLM invocation point for the agentic refinement step.
+    # The model receives the original RFQ, the current search payload, and the reasons
+    # why prior listings were rejected or not kept.
     provider = provider or get_llm_provider()
     prompt = build_refinement_prompt(raw_query, search_payload, user_feedback, rejected_listings)
     system_prompt = (
@@ -120,6 +123,8 @@ def refine_search_with_provider(
     )
 
     try:
+        # The provider may be a mock implementation or an OpenAI-compatible chat client.
+        # This indirection keeps model swaps easy and isolates the rest of the code from vendor details.
         response = provider.generate(prompt, system_prompt=system_prompt)
     except RuntimeError:
         response = "{\"keyword\": \"\", \"max_moq\": null, \"max_price_usd\": null, \"notes\": \"\"}"
