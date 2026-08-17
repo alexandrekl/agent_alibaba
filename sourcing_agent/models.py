@@ -5,6 +5,7 @@ class SourcingState(TypedDict, total=False):
     raw_query: str
     sku_num: str
     search_payload: Dict[str, Any]
+    search_queries: List[Dict[str, Any]]
     raw_results: List[Dict[str, Any]]
     shortlist: List[Dict[str, Any]]
     user_feedback: List[Dict[str, Any]]

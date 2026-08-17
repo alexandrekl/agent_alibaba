@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 from langgraph.graph import END, StateGraph
 
 from .apify_client import call_alibaba_proxy_api, _parse_moq, _parse_price
-from .llm_client import refine_search_with_provider
+from .llm_client import plan_search_queries_with_provider, refine_search_with_provider, run_search_tool_loop
 from .models import SourcingState
 from .requirements_parser import parse_requirements
 from urllib.parse import urlsplit, urlunsplit
@@ -28,6 +28,7 @@ def requirement_analyzer_node(state: SourcingState) -> Dict[str, Any]:
 
     return {
         "search_payload": payload,
+        "search_queries": state.get("search_queries", []),
         "shortlist": [],
         "user_feedback": [],
         "accepted_listings": state.get("accepted_listings", []),
@@ -39,14 +40,58 @@ def requirement_analyzer_node(state: SourcingState) -> Dict[str, Any]:
     }
 
 
-def api_sourcing_node(state: SourcingState) -> Dict[str, Any]:
-    print("--- [Node B] Querying Alibaba data layer ---")
+def plan_search_queries_node(state: SourcingState) -> Dict[str, Any]:
+    print("--- [Node B] Planning bounded Alibaba searches ---")
     payload = state["search_payload"]
-    results = call_alibaba_proxy_api(
-        keyword=payload["keyword"],
-        max_price=payload.get("max_price_usd"),
-        max_moq=payload.get("max_moq"),
+    planned_keywords = plan_search_queries_with_provider(
+        raw_query=state.get("raw_query", ""),
+        search_payload=payload,
     )
+    queries = [
+        {
+            "keyword": keyword,
+            "max_price_usd": payload.get("max_price_usd"),
+            "max_moq": payload.get("max_moq"),
+        }
+        for keyword in planned_keywords[:3]
+        if keyword.strip()
+    ]
+    if not queries:
+        queries = [dict(payload)]
+
+    return {
+        "search_queries": queries,
+        "logs": state["logs"] + [f"Planned {len(queries)} bounded Alibaba search query or queries."],
+    }
+
+
+def api_sourcing_node(state: SourcingState) -> Dict[str, Any]:
+    print("--- [Node C] Querying Alibaba data layer ---")
+    queries = state.get("search_queries") or [state["search_payload"]]
+    payload = state["search_payload"]
+
+    def execute_search(keyword: str) -> List[Dict[str, Any]]:
+        return call_alibaba_proxy_api(
+            keyword=keyword,
+            max_price=payload.get("max_price_usd"),
+            max_moq=payload.get("max_moq"),
+        )
+
+    results = run_search_tool_loop(
+        raw_query=state.get("raw_query", ""),
+        search_payload=payload,
+        execute_search=execute_search,
+    )
+    if results is None:
+        results = []
+        for query in queries[:3]:
+            results.extend(
+            call_alibaba_proxy_api(
+                keyword=query["keyword"],
+                max_price=query.get("max_price_usd"),
+                max_moq=query.get("max_moq"),
+            )
+            )
 
     # accepted_listings/rejected_listings may mix DB-shaped dicts (listing_title/supplier, from the
     # first call) with raw-shaped dicts (title/companyName, appended by review_shortlist_node below).
@@ -59,8 +104,10 @@ def api_sourcing_node(state: SourcingState) -> Dict[str, Any]:
     }
     filtered_results = []
     for item in results:
-        if _listing_identity(item) in seen_identities:
+        identity = _listing_identity(item)
+        if identity in seen_identities:
             continue
+        seen_identities.add(identity)
         filtered_results.append(item)
 
     return {
@@ -208,6 +255,7 @@ def refine_search_terms_node(state: SourcingState) -> Dict[str, Any]:
     new_round = review_round + 1
     return {
         "search_payload": updated_payload,
+        "search_queries": [],
         "review_round": new_round,
         "refinement_notes": provider_result["notes"],
         "logs": state.get("logs", []) + [f"Refined search terms via model adapter and moved to review round {new_round}."],
@@ -315,12 +363,14 @@ def _parse_trade_assurance(item: Dict[str, Any]) -> bool:
 def build_workflow() -> StateGraph:
     workflow = StateGraph(SourcingState)
     workflow.add_node("analyze_requirements", requirement_analyzer_node)
+    workflow.add_node("plan_search_queries", plan_search_queries_node)
     workflow.add_node("fetch_alibaba_data", api_sourcing_node)
     workflow.add_node("vet_and_rank_suppliers", supplier_vet_node)
     workflow.add_node("review_shortlist", review_shortlist_node)
     workflow.add_node("refine_search_terms", refine_search_terms_node)
     workflow.set_entry_point("analyze_requirements")
-    workflow.add_edge("analyze_requirements", "fetch_alibaba_data")
+    workflow.add_edge("analyze_requirements", "plan_search_queries")
+    workflow.add_edge("plan_search_queries", "fetch_alibaba_data")
     workflow.add_edge("fetch_alibaba_data", "vet_and_rank_suppliers")
     workflow.add_edge("vet_and_rank_suppliers", "review_shortlist")
     workflow.add_conditional_edges(
